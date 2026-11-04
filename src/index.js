@@ -1,8 +1,3 @@
-import {
-  createEventsRouter,
-  ensureEventIndexes,
-} from "./routes/events.js";
-import newsletterRoutes from "./routes/newsletter.js";
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
@@ -10,6 +5,11 @@ import { MongoClient } from "mongodb";
 import { toNodeHandler } from "better-auth/node";
 import { createAuth } from "./auth.js";
 import { createRequireAuth } from "./middleware/requireAuth.js";
+import {
+  createEventsRouter,
+  ensureEventIndexes,
+} from "./routes/events.js";
+import newsletterRoutes from "./routes/newsletter.js";
 
 const app = express();
 
@@ -17,13 +17,9 @@ const PORT = Number(process.env.PORT || 5000);
 const CLIENT_URL = (
   process.env.CLIENT_URL || "http://localhost:3000"
 ).replace(/\/+$/, "");
-const MONGODB_URI = process.env.MONGODB_URI;
-const MONGODB_DB = process.env.MONGODB_DB || "kindred";
 
-let client;
-let database;
-let server;
-let shuttingDown = false;
+let initialization;
+let mongoClient;
 
 app.disable("x-powered-by");
 
@@ -34,76 +30,61 @@ app.use(
   })
 );
 
-async function startServer() {
+async function initializeApi() {
+  const uri = process.env.MONGODB_URI;
+  const databaseName = process.env.MONGODB_DB || "kindred";
+
+  if (!uri) {
+    throw new Error("MONGODB_URI is missing.");
+  }
+
+  const client = new MongoClient(uri, {
+    serverSelectionTimeoutMS: 10000,
+    connectTimeoutMS: 10000,
+    socketTimeoutMS: 15000,
+  });
+
   try {
-    if (!MONGODB_URI) {
-      console.error("Missing MONGODB_URI in server/.env");
-      process.exitCode = 1;
-      return;
-    }
-
-    if (
-      !MONGODB_URI.startsWith("mongodb+srv://") &&
-      !MONGODB_URI.startsWith("mongodb://")
-    ) {
-      console.error(
-        "MONGODB_URI must begin with mongodb+srv:// or mongodb://"
-      );
-      process.exitCode = 1;
-      return;
-    }
-
-    if (MONGODB_URI.includes("<") || MONGODB_URI.includes(">")) {
-      console.error("Replace the placeholders in MONGODB_URI.");
-      process.exitCode = 1;
-      return;
-    }
-
-    client = new MongoClient(MONGODB_URI, {
-      serverSelectionTimeoutMS: 10000,
-      connectTimeoutMS: 10000,
-      socketTimeoutMS: 15000,
-    });
-
     console.log("Connecting to MongoDB...");
-
     await client.connect();
 
-    database = client.db(MONGODB_DB);
+    const database = client.db(databaseName);
     await database.command({ ping: 1 });
-
-    app.locals.db = database;
 
     console.log("MongoDB connected successfully.");
 
     const auth = createAuth(database, client);
     const requireAuth = createRequireAuth();
 
-    app.locals.auth = auth;
-
-    // Better Auth must run before express.json().
-    app.all("/api/auth/*splat", toNodeHandler(auth));
-
-    // Parse JSON for regular Express API routes.
-    app.use(express.json({ limit: "1mb" }));
-    app.use("/api/newsletter", newsletterRoutes);
     await ensureEventIndexes(database);
 
-app.use(
-  "/api/events",
-  createEventsRouter({
-    database,
-    requireAuth,
-  })
-);
+    const api = express();
+    api.disable("x-powered-by");
 
-    app.get("/", (req, res) => {
-      res.json({
-        message: "Kindred API is running",
-      });
+    api.locals.db = database;
+    api.locals.auth = auth;
+
+    // Better Auth handles its own request bodies.
+    api.all("/api/auth/*splat", toNodeHandler(auth));
+
+    // JSON parsing comes after the authentication handler.
+    api.use(express.json({ limit: "1mb" }));
+
+    api.use("/api/newsletter", newsletterRoutes);
+
+    api.use(
+      "/api/events",
+      createEventsRouter({
+        database,
+        requireAuth,
+      })
+    );
+
+    api.get("/", (req, res) => {
+      res.json({ message: "Kindred API is running" });
     });
 
-    app.get("/api/health", async (req, res) => {
+    api.get("/api/health", async (req, res) => {
       res.set("Cache-Control", "no-store");
 
       try {
@@ -114,7 +95,9 @@ app.use(
           service: "Kindred API",
           database: "connected",
         });
-      } catch {
+      } catch (error) {
+        console.error("Database health check failed:", error.name);
+
         res.status(503).json({
           status: "error",
           service: "Kindred API",
@@ -123,22 +106,18 @@ app.use(
       }
     });
 
-    // Protected endpoint: returns only a verified JWT identity.
-    app.get("/api/me", requireAuth, (req, res) => {
+    api.get("/api/me", requireAuth, (req, res) => {
       res.set("Cache-Control", "no-store");
-
-      res.json({
-        user: req.user,
-      });
+      res.json({ user: req.user });
     });
 
-    app.use((req, res) => {
+    api.use((req, res) => {
       res.status(404).json({
         message: "API route not found",
       });
     });
 
-    app.use((error, req, res, next) => {
+    api.use((error, req, res, next) => {
       if (res.headersSent) {
         return next(error);
       }
@@ -162,76 +141,72 @@ app.use(
       });
     });
 
-    server = app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Kindred API running at http://localhost:${PORT}`);
-      console.log("Better Auth initialized successfully.");
-    });
+    mongoClient = client;
+    console.log("Better Auth initialized successfully.");
 
-    server.on("error", async (error) => {
-      console.error(
-        error.code === "EADDRINUSE"
-          ? `Port ${PORT} is already in use. Stop the existing backend server.`
-          : `HTTP server failed: ${error.code || error.name}`
-      );
-
-      await client.close();
-      process.exitCode = 1;
-    });
+    return api;
   } catch (error) {
-    console.error(
-      `Server startup failed: ${error.name}; code: ${error.code || "none"}`
-    );
-
-    if (error.code === 18) {
-      console.error("MongoDB authentication failed. Check Atlas credentials.");
-    } else if (error.name === "MongoParseError") {
-      console.error("Check the MongoDB connection string format.");
-    } else if (error.name === "MongoServerSelectionError") {
-      console.error("Check Atlas availability and network access.");
-    } else {
-      console.error("Check the server environment and Better Auth configuration.");
-    }
-
-    if (client) {
-      await client.close().catch(() => {});
-    }
-
-    process.exitCode = 1;
+    await client.close().catch(() => {});
+    throw error;
   }
 }
 
-async function shutdown() {
-  if (shuttingDown) return;
+function getApi() {
+  if (!initialization) {
+    initialization = initializeApi().catch((error) => {
+      initialization = undefined;
+      throw error;
+    });
+  }
 
-  shuttingDown = true;
+  return initialization;
+}
 
-  console.log("Closing Kindred API...");
-
-  const timeout = setTimeout(() => process.exit(1), 10000);
-  timeout.unref();
+// Every request waits until database and routes are ready.
+// Concurrent requests share the same initialization promise.
+app.use(async (req, res, next) => {
+  let api;
 
   try {
-    if (server?.listening) {
-      await new Promise((resolve, reject) => {
-        server.close((error) => {
-          if (error) reject(error);
-          else resolve();
-        });
-      });
-    }
+    api = await getApi();
+  } catch (error) {
+    console.error("API initialization failed:", {
+      name: error.name,
+      code: error.code || "none",
+    });
 
-    if (client) {
-      await client.close();
-    }
-
-    clearTimeout(timeout);
-    process.exit(0);
-  } catch {
-    process.exit(1);
+    return res.status(503).json({
+      message:
+        "Backend initialization failed. Check server logs and environment settings.",
+    });
   }
+
+  return api(req, res, next);
+});
+
+// Vercel imports this application to handle requests.
+export default app;
+
+// Local development starts a normal HTTP server.
+if (!process.env.VERCEL) {
+  getApi()
+    .then(() => {
+      const server = app.listen(PORT, "0.0.0.0", () => {
+        console.log(`Kindred API running at http://localhost:${PORT}`);
+      });
+
+      server.on("error", async (error) => {
+        console.error("HTTP server failed:", error.code || error.name);
+        await mongoClient?.close().catch(() => {});
+        process.exitCode = 1;
+      });
+    })
+    .catch((error) => {
+      console.error("Server startup failed:", {
+        name: error.name,
+        code: error.code || "none",
+      });
+
+      process.exitCode = 1;
+    });
 }
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
-startServer();
